@@ -1642,7 +1642,7 @@ async function submitTopup(){
   log('TOPUP_SUBMIT', `Topup ${topup.id} ₭${topup.amount} by ${user.username}`);
   const _link = (settings.adminPanelUrl||'').trim().replace(/\/$/,'');
   const _linkLine = _link ? `\n👉 ໜ້າແອັດມິນ: ${_link}/?tab=topups` : '';
-  sendFacebookNotify(`ລູກຄ້າເຕີມເງິນຮ້ານ TOH Shop\n👤 ${user.username}\n💰 ₭${fmtK(topup.amount)}\n⏳ ລໍຖາແອັດມິນກວດສອບ${_linkLine}`);
+  sendFacebookNotify(`ລູກຄ້າແຈ້ເຕີມເງິນຮ້ານ TOH Shop\n👤 ${user.username}\n💰 ₭${fmtK(topup.amount)}\n⏳ ລໍຖ້າແອັດມິນກວດສອບ${_linkLine}`);
   window._topupSlipDataUrl = null;
   document.getElementById('topupSlipPreview').classList.add('hidden');
   clearInterval(_countdownInterval);
@@ -1650,10 +1650,10 @@ async function submitTopup(){
   Swal.fire({
     icon:'success',
     title:'ສົ່ງການເຕີມເງິນສຳເລີດ ✅',
-    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ລໍວถ້າແອັດມິນກວດສົບແລະຊື່ນຊັນ</p>
+    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ລໍຖ້າແອັດມິນກວດສອບແລະຊື່ນຊັນ</p>
             <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;text-align:left;">
               <p style="font-size:13px;color:#94A3B8;">&#x23F3; ເງິນຈະເຂ້າກະເປົາຂອງທ່ານພາຍໃນ <b style="color:#a78bfa;">1-3 ນາທີ</b> ຫລັງແອັດມິນຊື່ນຊັນ</p>
-              <p style="font-size:12px;color:#64748B;margin-top:6px;">&#x26A0;&#xFE0F; ຫາກເງິນບໍ່ເຂ້າພາຍໃນ  3 ນາທີ ກະລຸນາທັກຫາແອັດມິນເດີຍການ</p>
+              <p style="font-size:12px;color:#64748B;margin-top:6px;">&#x26A0;&#xFE0F; ຫາກເງິນບໍ່ເຂ້າພາຍໃນ  3 ນາທີ ກະລຸນາທັກຫາແອັດມິນໃດເລີຍ</p>
             </div>`,
     background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC'
   });
