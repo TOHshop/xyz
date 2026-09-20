@@ -426,14 +426,7 @@ body { font-family: 'Inter','Noto Sans Lao',sans-serif; background:#0B0F19; colo
     </div>
     <label class="text-xs font-display text-mist-400 uppercase">ເລືອກຈຳນວນເງິນ</label>
     <div id="quickAmountGrid" class="grid grid-cols-3 sm:grid-cols-4 gap-2 mt-2 mb-4">
-      <button onclick="pickTopupAmount(10000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭10,000</button>
-      <button onclick="pickTopupAmount(20000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭20,000</button>
-      <button onclick="pickTopupAmount(50000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭50,000</button>
-      <button onclick="pickTopupAmount(100000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭100,000</button>
-      <button onclick="pickTopupAmount(200000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭200,000</button>
-      <button onclick="pickTopupAmount(500000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭500,000</button>
-      <button onclick="pickTopupAmount(1000000, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭1,000,000</button>
-      <div class="relative"><input id="customTopupAmount" type="number" placeholder="ກຳນົດເອງ" oninput="pickTopupAmount(this.value, true)" class="w-full h-full px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-100 font-mono text-sm placeholder-mist-400 focus:outline-none focus:border-plasma-500"></div>
+      <!-- rendered by renderTopupAmountButtons() -->
     </div>
     <div id="topupLockedNotice" class="hidden mb-4 px-4 py-2.5 rounded-lg bg-ion-500/10 border border-ion-500/30 text-ion-400 text-xs font-display"><i class="fa-solid fa-lock mr-1.5"></i>ມີ QR ທີ່ກຳລັງລໍຖ້າຢູ່ແລ້ວ ກະລຸນາຊຳລະ ຫຼື ລໍຖ້າໝົດເວລາກ່ອນຈຶ່ງເລືອກຈຳນວນເງິນໃໝ່</div>
     <div id="topupConfirmArea" class="hidden mb-4 flex items-center justify-between gap-3 px-4 py-3 rounded-lg bg-ink-900 border border-plasma-500/40">
@@ -636,25 +629,23 @@ const ADMIN_SYNC_KEYS = ['admins','products','orders','logs','topups','settings'
 // the fresh local save right back to nothing. pullAdminDataFromFirestore
 // waits for any pending write below before it reads, closing that gap.
 const _pendingSyncs = new Map();
+async function _ensureAuth(){
+  if(fbAuth.currentUser) return;
+  try{ await fbAuth.signInAnonymously(); }catch(e){ console.warn('Anonymous auth failed', e); }
+}
 function syncKeyToFirestore(key, val){
-  // Not signed in to Firebase Auth yet (e.g. an anonymous visitor just
-  // browsing the shop, before any admin login happened this session) — the
-  // write is guaranteed to be rejected by the rules, so skip it entirely
-  // instead of firing a doomed network request at every regular customer
-  // who happens to load the page while data is seeding.
-  if(!fbAuth.currentUser) return;
-  const p = fbDb.collection(CLOUD_COLLECTION).doc(key).set({ data: val, updatedAt: nowISO() })
-    .catch(e=>{
-      console.warn('Firestore sync failed for', key, e);
-      // Only alert the admin — an ordinary visitor's browser can trigger
-      // this too (e.g. first-time seeding before anyone has logged in),
-      // and a failed sync there is expected/silent, not something they
-      // need to see or can do anything about.
-      if(SESSION && SESSION.role==='admin' && typeof toastErr === 'function'){
-        toastErr(`ບໍ່ສາມາດ sync "${key}" ຂຶ້ນຄລາວໄດ້ (ອາດຮູບໃຫຍ່ເກີນໄປ)`);
-      }
-    })
-    .finally(()=>{ if(_pendingSyncs.get(key) === p) _pendingSyncs.delete(key); });
+  const p = (async () => {
+    await _ensureAuth();
+    if(!fbAuth.currentUser) return;
+    return fbDb.collection(CLOUD_COLLECTION).doc(key).set({ data: val, updatedAt: nowISO() })
+      .catch(e=>{
+        console.warn('Firestore sync failed for', key, e);
+        if(SESSION && SESSION.role==='admin' && typeof toastErr === 'function'){
+          toastErr(`ບໍ່ສາມາດ sync "${key}" ຂຶ້ນຄລາວໄດ້ (ອາດຮູບໃຫຍ່ເກີນໄປ)`);
+        }
+      })
+      .finally(()=>{ if(_pendingSyncs.get(key) === p) _pendingSyncs.delete(key); });
+  })();
   _pendingSyncs.set(key, p);
 }
 // Pulls every shop-wide doc from Firestore and merges it into the local cache,
@@ -756,6 +747,7 @@ async function seedIfNeeded(){
   if(loadDB(DB_KEYS.logs, []).length === 0) saveDB(DB_KEYS.logs, []);
   if(loadDB(DB_KEYS.topups, []).length === 0) saveDB(DB_KEYS.topups, []);
   if(!localStorage.getItem(DB_KEYS.settings)) saveDB(DB_KEYS.settings, { qrImage: null, bgImage: null, heroBannerImage: null, siteLogo: null, siteName: '', promoText: '', promoText2: '' });
+  renderTopupAmountButtons();
 }
 
 function log(action, detail){
@@ -1565,6 +1557,16 @@ function renderWallet(){
   renderTopupHistory();
 }
 
+function renderTopupAmountButtons(){
+  const settings = loadDB(DB_KEYS.settings, {});
+  const amounts = settings.topupAmounts || [10000,20000,50000,100000,200000,500000,1000000];
+  const grid = document.getElementById('quickAmountGrid');
+  if(!grid) return;
+  grid.innerHTML = amounts.map(amt =>
+    `<button onclick="pickTopupAmount(${amt}, false)" class="topup-amt-btn px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-200 font-mono text-sm hover:border-plasma-500">₭${fmtK(amt)}</button>`
+  ).join('') +
+  `<div class="relative"><input id="customTopupAmount" type="number" placeholder="ກຳນົດເອງ" oninput="pickTopupAmount(this.value, true)" class="w-full h-full px-3 py-2.5 rounded-lg bg-ink-900 border border-ink-600 text-mist-100 font-mono text-sm placeholder-mist-400 focus:outline-none focus:border-plasma-500"></div>`;
+}
 function pickTopupAmount(amount, isCustom){
   const user = currentUser(); if(!user) return;
   if(getActiveTopupSession(user.id)){ return; } // ລັອກໄວ້ຈົນກວ່າ QR ເກົ່າຈະໝົດເວລາ
@@ -1603,7 +1605,11 @@ function confirmTopupAmount(){
 function renderPaymentQr(holderId, payload){
   const settings = loadDB(DB_KEYS.settings, {qrImage:null});
   const holder = document.getElementById(holderId);
-  if(settings.qrImage){ holder.innerHTML = `<img src="${settings.qrImage}" class="w-52 h-52 object-contain">`; }
+  // ໃຊ້ QR ສະເພາະຂອງຈຳນວນເງິນ ຖ້າມີ
+  const qrByAmount = settings.qrByAmount || {};
+  const amtQr = CURRENT_TOPUP_AMOUNT && qrByAmount[CURRENT_TOPUP_AMOUNT];
+  const qrSrc = amtQr || settings.qrImage;
+  if(qrSrc){ holder.innerHTML = `<img src="${qrSrc}" class="w-52 h-52 object-contain">`; }
   else if(window.QRCode){ holder.innerHTML = `<canvas></canvas>`; QRCode.toCanvas(holder.querySelector('canvas'), payload, { width:208, margin:1, color:{dark:'#0B0F19', light:'#FFFFFF'} }); }
 }
 document.getElementById('topupSlipInput')?.addEventListener('change', async function(e){
@@ -1624,129 +1630,33 @@ function sendFacebookNotify(message){
     pixel.src = url;
   }catch(e){ /* silent — notification is best-effort, never block the app */ }
 }
-function _withTimeout(promise, ms){
-  return Promise.race([promise, new Promise(res=>setTimeout(()=>res(null), ms))]);
-}
-async function readSlipWithAI(dataUrl){
-  try{
-    const settings = loadDB(DB_KEYS.settings, {geminiApiKey:''});
-    const key = (settings.geminiApiKey||'').trim();
-    if(!key) return null;
-    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl||'');
-    if(!match) return null;
-    const mimeType = match[1], base64Data = match[2];
-    const prompt = 'ນີ້ແມ່ນຮູບສະລິບ/ໃບຢືນຢັນການໂອນເງິນຈາກທະນາຄານ ຫຼື e-wallet ໃນລາວ (ອາດເປັນ BCEL, LDB, JDB, ST Bank, ACLEDA, ທະນາຄານອິນໂດຈີນ, APB, U-Money, Trust Bank, TrueMoney ຫຼືອື່ນໆ — ຮອງຮັບທຸກຮູບແບບ). ອ່ານຂໍ້ມູນຢ່າງລະອຽດທີ່ສຸດ ແລະ ຕອບເປັນ JSON ຢ່າງດຽວ ຮູບແບບນີ້ເທົ່ານັ້ນ, ບໍ່ຕ້ອງອະທິບາຍເພີ່ມ: {"amount": ຈຳນວນເງິນທີ່ໂອນ (number, ບໍ່ມີເຄື່ອງໝາຍ +/-, ຈຸດ, ຄອມມາ; null ຖ້າອ່ານບໍ່ໄດ້), "sender": "ຊື່ຜູ້ໂອນ/ຜູ້ສົ່ງເງິນ ຫຼື null", "receiver": "ຊື່ຜູ້ຮັບເງິນ/ບັນຊີປາຍທາງ ຫຼື null", "datetime": "ວັນທີ ແລະ ເວລາທຸລະກຳ ໃນຮູບແບບ YYYY-MM-DDTHH:mm:ss ຖ້າອ່ານໄດ້, null ຖ້າອ່ານບໍ່ໄດ້", "ref": "ເລກອ້າງອີງ/ເລກທຸລະກຳ ຫຼື null", "tamperedStatus": "clean" (ໝັ້ນໃຈວ່າຮູບຖືກຕ້ອງ) ຫຼື "tampered" (ໝັ້ນໃຈວ່າຖືກຕັດຕໍ່/ແກ້ໄຂ) ຫຼື "unsure" (ບໍ່ໝັ້ນໃຈ, ເຫັນບາງຢ່າງແປກແຕ່ບອກບໍ່ໄດ້ແນ່ນອນ — ໃຫ້ໃຊ້ "unsure" ທຸກຄັ້ງທີ່ບໍ່ໝັ້ນໃຈ 100% ແທນທີ່ຈະທາຍ), "tamperedReason": "ອະທິບາຍສັ້ນໆວ່າເປັນຫຍັງຄິດວ່າ tampered ຫຼື unsure, null ຖ້າ clean"}';
-    const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${encodeURIComponent(key)}`, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        contents:[{ parts:[ {text:prompt}, {inline_data:{mime_type:mimeType, data:base64Data}} ] }],
-        generationConfig:{ response_mime_type:'application/json' }
-      })
-    });
-    if(!resp.ok) return null;
-    const data = await resp.json();
-    const text = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
-    if(!text) return null;
-    const parsed = JSON.parse(text);
-    return {
-      amount: (parsed.amount===undefined?null:parsed.amount),
-      sender: parsed.sender||null,
-      receiver: parsed.receiver||null,
-      datetime: parsed.datetime||null,
-      ref: parsed.ref||null,
-      tamperedStatus: (parsed.tamperedStatus==='tampered'||parsed.tamperedStatus==='unsure') ? parsed.tamperedStatus : 'clean',
-      tamperedReason: parsed.tamperedReason||null
-    };
-  }catch(e){ return null; }
-}
-// Runs the fraud-check rules against what the AI read. Returns null when the
-// AI didn't return usable data (so the caller falls back to manual review
-// instead of guessing); otherwise {approved, reasons[]} — reasons explains
-// every rule that failed, always shown to both the customer and the admin.
-function evaluateTopupWithAI(topupAmount, aiRead, settings){
-  if(!aiRead) return null;
-  const reasons = [];
-  if(aiRead.amount == null || Number(aiRead.amount) !== Number(topupAmount)){
-    reasons.push(`ຈຳນວນເງິນໃນສະລິບ (${aiRead.amount!=null?'₭'+fmtK(aiRead.amount):'ອ່ານບໍ່ໄດ້'}) ບໍ່ກົງກັບຈຳນວນທີ່ເລືອກເຕີມ (₭${fmtK(topupAmount)})`);
-  }
-  const validNamesRaw = (settings.receiverNames||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-  if(validNamesRaw.length){
-    const recv = (aiRead.receiver||'').trim().toLowerCase();
-    const receiverOk = recv && validNamesRaw.some(n=> n && (recv.includes(n) || n.includes(recv)));
-    if(!receiverOk) reasons.push(`ຊື່ຜູ້ຮັບເງິນໃນສະລິບ ("${aiRead.receiver||'ອ່ານບໍ່ໄດ້'}") ບໍ່ກົງກັບບັນຊີຮ້ານທີ່ຕັ້ງໄວ້`);
-  }
-  let needsReview = false, reviewReason = null;
-  if(aiRead.tamperedStatus === 'tampered'){
-    reasons.push(`AI ພົບຮ່ອງຮອຍການແກ້ໄຂຮູບ: ${aiRead.tamperedReason||'ບໍ່ລະບຸເຫດຜົນ'}`);
-  } else if(aiRead.tamperedStatus === 'unsure'){
-    // AI itself isn't confident whether this slip was edited — don't let it
-    // guess either way. Route to the admin instead of auto-approving or
-    // auto-rejecting on a coin-flip.
-    needsReview = true;
-    reviewReason = aiRead.tamperedReason || 'AI ບໍ່ໝັ້ນໃຈວ່າຮູບສະລິບຖືກຕັດຕໍ່/ແກ້ໄຂຫຼືບໍ່';
-  }
-  if(aiRead.datetime){
-    const txTime = new Date(aiRead.datetime);
-    if(!isNaN(txTime.getTime())){
-      const diffMin = (Date.now() - txTime.getTime())/60000;
-      if(diffMin > 20 || diffMin < -5){
-        reasons.push(`ເວລາໂອນໃນສະລິບ (${aiRead.datetime}) ຫ່າງຈາກເວລາປັດຈຸບັນເກີນ 20 ນາທີ — ອາດເປັນສະລິບເກົ່າ/ໃຊ້ຊ້ຳ`);
-      }
-    }
-  }
-  if(needsReview) return { approved:false, needsReview:true, reviewReason, reasons };
-  return { approved: reasons.length===0, needsReview:false, reasons };
-}
 async function submitTopup(){
   const user = currentUser(); if(!user) return;
-  if(!CURRENT_TOPUP_AMOUNT || CURRENT_TOPUP_AMOUNT < 1000) return toastErr('ກະລຸນາເລືອກ ຫຼື ປ້ອນຈຳນວນເງິນ');
-  if(!window._topupSlipDataUrl) return toastErr('ກະລຸນາອັບໂຫຼດສະລິບການໂອນເງິນກ່ອນ');
+  if(!CURRENT_TOPUP_AMOUNT || CURRENT_TOPUP_AMOUNT < 1000) return toastErr('ກະລຸນາເລືອກ ຫລື ປ້ອນຈຳນວນເງິນ');
+  if(!window._topupSlipDataUrl) return toastErr('ກະລຸນາອັບໂຫລດສະລິບການໂອນເງິນກ່ອນ');
   const slipData = window._topupSlipDataUrl;
-  toastInfo('ກຳລັງກວດສະລິບ...');
   const settings = loadDB(DB_KEYS.settings, {});
-  const aiRead = await _withTimeout(readSlipWithAI(slipData), 10000);
-  const aiDecision = evaluateTopupWithAI(CURRENT_TOPUP_AMOUNT, aiRead, settings);
-  let finalStatus = 'pending_verification';
-  if(aiDecision && !aiDecision.needsReview) finalStatus = aiDecision.approved ? 'completed' : 'rejected';
   const topups = loadDB(DB_KEYS.topups, []);
-  const topup = { id: uid('top'), userId:user.id, amount:CURRENT_TOPUP_AMOUNT, slip:slipData, status:finalStatus, createdAt: nowISO(), verifiedAt: finalStatus!=='pending_verification'?nowISO():null, aiRead: aiRead||null, aiDecision: aiDecision||null };
+  const topup = { id: uid('top'), userId:user.id, amount:CURRENT_TOPUP_AMOUNT, slip:slipData, status:'pending_verification', createdAt: nowISO(), verifiedAt: null };
   topups.push(topup); saveDB(DB_KEYS.topups, topups);
-  if(finalStatus==='completed'){
-    const users2 = loadDB(DB_KEYS.users, []);
-    const idx2 = users2.findIndex(u=>u.id===user.id);
-    if(idx2>-1){ users2[idx2].balance = (users2[idx2].balance||0) + topup.amount; saveDB(DB_KEYS.users, users2); }
-    notifyUser(user.id, 'ເຕີມເງິນສຳເລັດ (AI ອະນຸມັດອັດຕະໂນມັດ)', `AI ກວດສະລິບແລ້ວ ອະນຸມັດ ₭${fmtK(topup.amount)} ເຂົ້າກະເປົາຂອງທ່ານໂດຍອັດຕະໂນມັດ.`);
-    log('TOPUP_AI_APPROVE', `AI auto-approved topup ${topup.id} ₭${topup.amount} for ${user.username}`);
-  } else if(finalStatus==='rejected'){
-    notifyUser(user.id, 'ການເຕີມເງິນຖືກປະຕິເສດ (AI ກວດພົບບັນຫາ)', `ເຫດຜົນ: ${aiDecision.reasons.join('; ')}. ຖ້າທ່ານແນ່ໃຈວ່າໂອນຖືກຕ້ອງ ກະລຸນາຕິດຕໍ່ແອດມິນ.`);
-    log('TOPUP_AI_REJECT', `AI auto-rejected topup ${topup.id} for ${user.username}: ${aiDecision.reasons.join('; ')}`);
-  } else if(aiDecision && aiDecision.needsReview){
-    log('TOPUP_AI_REVIEW', `AI unsure about topup ${topup.id} for ${user.username}: ${aiDecision.reviewReason}`);
-  } else {
-    log('TOPUP_SUBMIT', `Topup ${topup.id} ₭${topup.amount} by ${user.username} (ລໍຖ້າກວດສອບດ້ວຍຕົນເອງ — AI ບໍ່ພ້ອມ)`);
-  }
-  {
-    const _link = (settings.adminPanelUrl||'').trim().replace(/\/$/,'');
-    const _linkLine = _link ? `\n👉 ໜ້າແອດມິນ: ${_link}/?tab=topups` : '';
-    let _statusLine;
-    if(finalStatus==='completed') _statusLine = '\n✅ AI ອະນຸມັດອັດຕະໂນມັດ';
-    else if(finalStatus==='rejected') _statusLine = `\n❌ AI ປະຕິເສດອັດຕະໂນມັດ: ${aiDecision.reasons.join('; ')}`;
-    else if(aiDecision && aiDecision.needsReview) _statusLine = `\n⚠️ AI ບໍ່ໝັ້ນໃຈ — ກະລຸນາກວດດ້ວຍຕົນເອງ: ${aiDecision.reviewReason}`;
-    else _statusLine = '\n⏳ ລໍຖ້າກວດສອບດ້ວຍຕົນເອງ (AI ບໍ່ພ້ອມ)';
-    sendFacebookNotify(`ລູກຄ້າແຈ້ງເຕີມເງິນຮ້ານ TOH Shop\n👤 ${user.username}\n💰 ₭${fmtK(topup.amount)}${_statusLine}${_linkLine}`);
-  }
+  log('TOPUP_SUBMIT', `Topup ${topup.id} ₭${topup.amount} by ${user.username}`);
+  const _link = (settings.adminPanelUrl||'').trim().replace(/\/$/,'');
+  const _linkLine = _link ? `\n👉 ໜ້າແອັດມິນ: ${_link}/?tab=topups` : '';
+  sendFacebookNotify(`ລູກຄ້າເຕີມເງິນຮ້ານ TOH Shop\n👤 ${user.username}\n💰 ₭${fmtK(topup.amount)}\n⏳ ລໍຖາແອັດມິນກວດສອບ${_linkLine}`);
   window._topupSlipDataUrl = null;
   document.getElementById('topupSlipPreview').classList.add('hidden');
   clearInterval(_countdownInterval);
   clearActiveTopupSession(user.id);
-  if(finalStatus==='completed'){
-    Swal.fire({ icon:'success', title:'ເຕີມເງິນສຳເລັດ!', text:`AI ກວດສະລິບແລ້ວ ອະນຸມັດອັດຕະໂນມັດ ₭${fmtK(topup.amount)} ເຂົ້າກະເປົາຂອງທ່ານແລ້ວ`, background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC' });
-  } else if(finalStatus==='rejected'){
-    Swal.fire({ icon:'error', title:'ການເຕີມເງິນຖືກປະຕິເສດ', html:`ເຫດຜົນ:<br>${aiDecision.reasons.map(escapeHtml).join('<br>')}<br><br>ຖ້າທ່ານແນ່ໃຈວ່າໂອນຖືກຕ້ອງ ກະລຸນາຕິດຕໍ່ແອດມິນ`, background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC' });
-  } else {
-    Swal.fire({ icon:'success', title:'ສົ່ງການເຕີມເງິນສຳເລັດ', text:'ລໍຖ້າແອດມິນກວດສອບແລະຢືນຢັນ', background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC' });
-  }
+  Swal.fire({
+    icon:'success',
+    title:'ສົ່ງການເຕີມເງິນສຳເລີດ ✅',
+    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ລໍວถ້າແອັດມິນກວດສົບແລະຊື່ນຊັນ</p>
+            <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;text-align:left;">
+              <p style="font-size:13px;color:#94A3B8;">&#x23F3; ເງິນຈະເຂ້າກະເປົາຂອງທ່ານພາຍໃນ <b style="color:#a78bfa;">1-3 ນາທີ</b> ຫລັງແອັດມິນຊື່ນຊັນ</p>
+              <p style="font-size:12px;color:#64748B;margin-top:6px;">&#x26A0;&#xFE0F; ຫາກເງິນບໍ່ເຂ້າພາຍໃນ  3 ນາທີ ກະລຸນາທັກຫາແອັດມິນເດີຍການ</p>
+            </div>`,
+    background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC'
+  });
   renderWallet();
 }
 function renderTopupHistory(){
