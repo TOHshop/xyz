@@ -1642,7 +1642,7 @@ async function submitTopup(){
   log('TOPUP_SUBMIT', `Topup ${topup.id} ₭${topup.amount} by ${user.username}`);
   const _link = (settings.adminPanelUrl||'').trim().replace(/\/$/,'');
   const _linkLine = _link ? `\n👉 ໜ້າແອັດມິນ: ${_link}/?tab=topups` : '';
-  sendFacebookNotify(`ລູກຄ້າແຈ້ເຕີມເງິນຮ້ານ TOH Shop\n👤 ${user.username}\n💰 ₭${fmtK(topup.amount)}\n⏳ ລໍຖ້າແອັດມິນກວດສອບ${_linkLine}`);
+  sendFacebookNotify(`ລູກຄ້າແຈ້ເຕີມເງິນຮ້ານ TOH Shop\n👤 ${user.username}\n💰 ₭${fmtK(topup.amount)}\n⏳ ລໍວถ້າແອັດມິນກວດສົບ${_linkLine}`);
   window._topupSlipDataUrl = null;
   document.getElementById('topupSlipPreview').classList.add('hidden');
   clearInterval(_countdownInterval);
@@ -1650,15 +1650,90 @@ async function submitTopup(){
   Swal.fire({
     icon:'success',
     title:'ສົ່ງການເຕີມເງິນສຳເລີດ ✅',
-    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ລໍຖ້າແອັດມິນກວດສອບແລະຊື່ນຊັນ</p>
+    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ລໍວถ້າແອັດມິນກວດສົບແລະຊື່ນຊັນ</p>
             <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;text-align:left;">
               <p style="font-size:13px;color:#94A3B8;">&#x23F3; ເງິນຈະເຂ້າກະເປົາຂອງທ່ານພາຍໃນ <b style="color:#a78bfa;">1-3 ນາທີ</b> ຫລັງແອັດມິນຊື່ນຊັນ</p>
-              <p style="font-size:12px;color:#64748B;margin-top:6px;">&#x26A0;&#xFE0F; ຫາກເງິນບໍ່ເຂ້າພາຍໃນ  3 ນາທີ ກະລຸນາທັກຫາແອັດມິນໃດເລີຍ</p>
+              <p style="font-size:12px;color:#64748B;margin-top:6px;">&#x26A0;&#xFE0F; ຫາກເງິນບໍ່ເຂ້າພາຍໃນ  3 ນາທີ ກະລຸນາທັກຫາແອັດມິນເດີຍການ</p>
             </div>`,
     background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC'
   });
   renderWallet();
 }
+async function buyNow(productId){
+  const user = currentUser();
+  if(!user){ toastErr('ກະລຸນາເຂົ້າສູ່ລະບົບກ່ອນ'); go('auth'); return; }
+  if(user.suspended){ toastErr('ບັນຊີຂອງທ່ານຖືກລະງັບ, ກະລຸນາຕິດຕໍ່ແອດມິນ'); return; }
+  const p = await api.getProduct(productId);
+  if(!p){ toastErr('ບໍ່ພົບສິນຄ້ານີ້'); return; }
+  if(p.status !== 'available'){ toastErr('ສິນຄ້ານີ້ຂາຍໝົດແລ້ວ'); return; }
+  if((user.balance||0) < p.price){
+    const shortfall = p.price - (user.balance||0);
+    Swal.fire({
+      icon:'warning', title:'ຍອດເງິນບໍ່ພໍ',
+      html:`<p class="text-sm text-mist-300 mb-2">ລາຄາສິນຄ້າ: <b class="text-ion-400">₭ ${fmtK(p.price)}</b></p>
+            <p class="text-sm text-mist-300">ຍອດເງິນໃນກະເປົ໋": <b class="text-ion-400">₭ ${fmtK(user.balance||0)}</b></p>
+            <p class="text-sm text-red-400 mt-2">ຍັງຂາດ: ₭ ${fmtK(shortfall)}</p>`,
+      confirmButtonText:'ເຕີມເງິນ', cancelButtonText:'ຍົກເລີກ',
+      showCancelButton:true, background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC', cancelButtonColor:'#3A4560'
+    }).then(r=>{ if(r.isConfirmed){ closeProductModal(); go('dashboard'); dashTab('wallet'); } });
+    return;
+  }
+  const result = await Swal.fire({
+    icon:'question', title:'ຢືນຢັນການຊື້',
+    html:`<p class="text-sm text-mist-300 mb-1">ສິນຄ້າ: <b class="text-mist-100">${escapeHtml(p.name)}</b></p>
+          <p class="text-sm text-mist-300">ລາຄາ: <b class="text-ion-400">₭ ${fmtK(p.price)}</b></p>
+          <p class="text-xs text-mist-400 mt-2">ເງິນຈະຖືກຫັກຈາກກະເປົ໋ທັນທີ ແລະ ລໍຖ້າແອດມິນຢືນຢັນ</p>`,
+    confirmButtonText:'ຊື້ທັນທີ', cancelButtonText:'ຍົກເລີກ',
+    showCancelButton:true, background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC', cancelButtonColor:'#3A4560'
+  });
+  if(!result.isConfirmed) return;
+  // ຫັກເງິນ
+  const users = loadDB(DB_KEYS.users,[]);
+  const uIdx = users.findIndex(x=>x.id===user.id);
+  if(uIdx<0){ toastErr('ເກີດຂໍ້ຜິດພາດ, ກະລຸນາລອງໃໝ່'); return; }
+  users[uIdx].balance = (users[uIdx].balance||0) - p.price;
+  saveDB(DB_KEYS.users, users);
+  // ສ້າງ order
+  const order = {
+    id: uid('ord'),
+    userId: user.id,
+    productId: p.id,
+    amount: p.price,
+    status: 'pending_verification',
+    paymentMethod: 'balance',
+    slip: null,
+    createdAt: nowISO(),
+    verifiedAt: null,
+    deliveryCode: null,
+    deliveryVideoUrl: null
+  };
+  const orders = loadDB(DB_KEYS.orders,[]);
+  orders.unshift(order);
+  saveDB(DB_KEYS.orders, orders);
+  log('ORDER_PLACE', `Order ${order.id} by ${user.username} for ${p.name} ₭${p.price}`);
+  // ແຈ້ງ Facebook
+  const settings = loadDB(DB_KEYS.settings,{});
+  const _link = (settings.adminPanelUrl||'').trim().replace(/\/$/,'');
+  const _linkLine = _link ? `\n👉 ໜ້າແອັດມິນ: ${_link}/?tab=payments` : '';
+  sendFacebookNotify(`ລູກຄ້າສັ່ງຊື້ສິນຄ້າ (ຊຳລະດ້ວຍ Wallet)\n👤 ${user.username}\n🛒 ${p.name}\n💰 ₭${fmtK(p.price)}${_linkLine}`);
+  // ແຈ້ງເຕືອນຜູ້ໃຊ້
+  users[uIdx].notifications = users[uIdx].notifications||[];
+  users[uIdx].notifications.push({ id:uid('ntf'), title:'ສັ່ງຊື້ສຳເລັດ', message:`ຄຳສັ່ງຊື້ ${p.name} ₭${fmtK(p.price)} ສຳເລັດ. ລໍຖ້າແອດມິນຢືນຢັນ.`, read:false, at:nowISO() });
+  saveDB(DB_KEYS.users, users);
+  renderAuthArea();
+  closeProductModal();
+  Swal.fire({
+    icon:'success', title:'ສັ່ງຊື້ສຳເລັດ! ✅',
+    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ຄຳສັ່ງຊື້ <b style="color:#E7EAF3;">${escapeHtml(p.name)}</b> ຖືກສ້າງແລ້ວ</p>
+          <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;text-align:left;">
+            <p style="font-size:13px;color:#94A3B8;">⏳ ລໍຖ້າແອດມິນຢືນຢັນ <b style="color:#a78bfa;">1-5 ນາທີ</b></p>
+            <p style="font-size:12px;color:#64748B;margin-top:6px;">📋 ກວດສອບໄດ້ທີ່ ແດດສ໌ບອດ → ປະຫວັດການສັ່ງຊື້</p>
+          </div>`,
+    background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC',
+    confirmButtonText:'ເບິ່ງປະຫວັດ'
+  }).then(()=>{ go('dashboard'); dashTab('orders'); });
+}
+
 function renderTopupHistory(){
   const user = currentUser(); if(!user) return;
   const topups = loadDB(DB_KEYS.topups, []).filter(t=>t.userId===user.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
