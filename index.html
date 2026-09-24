@@ -591,9 +591,35 @@ const fbDb = firebase.firestore();
 // Firebase Auth needs an email, but this app only collects a username,
 // so we map username -> a fake email address under a private domain.
 function usernameToEmail(username){ return String(username).toLowerCase()+'@vaultplay.app'; }
-async function syncUserToFirestore(user){
-  try{ await fbDb.collection('users').doc(user.id).set(user, {merge:true}); }
+async function syncUserToFirestore(user, opts){
+  try{
+    const data = {...user};
+    // FIX: `balance` must NEVER be written from a local cache copy. A stale
+    // cached balance (e.g. the admin's copy from before a customer bought
+    // something) used to overwrite the real balance in Firestore, so the
+    // deduction "disappeared". Balance is only changed via adjustUserBalance().
+    if(!(opts && opts.withBalance)) delete data.balance;
+    await fbDb.collection('users').doc(user.id).set(data, {merge:true});
+  }
   catch(e){ console.warn('Firestore sync failed for user', user.id, e); }
+}
+// Atomic balance change done on the server copy (Firestore transaction), then
+// mirrored into the local cache. delta < 0 = deduct, delta > 0 = add.
+// opts.strict: throw 'INSUFFICIENT_BALANCE' instead of clamping at 0.
+async function adjustUserBalance(userId, delta, opts){
+  const ref = fbDb.collection('users').doc(userId);
+  const newBal = await fbDb.runTransaction(async tx=>{
+    const snap = await tx.get(ref);
+    const cur = (snap.exists && Number(snap.data().balance)) || 0;
+    if(cur + delta < 0 && opts && opts.strict) throw new Error('INSUFFICIENT_BALANCE');
+    const next = Math.max(0, cur + delta);
+    tx.set(ref, { balance: next }, { merge:true });
+    return next;
+  });
+  const us = loadDB(DB_KEYS.users, []);
+  const i = us.findIndex(u=>u.id===userId);
+  if(i>-1){ us[i].balance = newBal; localStorage.setItem(DB_KEYS.users, JSON.stringify(us)); }
+  return newBal;
 }
 // Pulls every user document from Firestore and merges it into the local
 // cache. Used by the admin panel so registrations made on OTHER devices
@@ -773,7 +799,7 @@ const api = {
       { id: uid('ntf'), title:'ຍິນດີຕ້ອນຮັບສູ່ TOH Shop', message:'ບັນຊີຂອງທ່ານຖືກສ້າງສຳເລັດແລ້ວ.', read:false, at: nowISO() }
     ], createdAt: nowISO() };
     users.push(user); saveDB(DB_KEYS.users, users);
-    await syncUserToFirestore(user);
+    await syncUserToFirestore(user, {withBalance:true});
     log('REGISTER', `New user: ${username}`);
     return { token: 'jwt.'+uid('tok'), user };
   },
@@ -1682,56 +1708,80 @@ async function buyNow(productId){
     icon:'question', title:'ຢືນຢັນການຊື້',
     html:`<p class="text-sm text-mist-300 mb-1">ສິນຄ້າ: <b class="text-mist-100">${escapeHtml(p.name)}</b></p>
           <p class="text-sm text-mist-300">ລາຄາ: <b class="text-ion-400">₭ ${fmtK(p.price)}</b></p>
-          <p class="text-xs text-mist-400 mt-2">ເງິນຈະຖືກຫັກຈາກກະເປົ໋ທັນທີ ແລະ ລໍຖ້າແອດມິນຢືນຢັນ</p>`,
+          <p class="text-xs text-mist-400 mt-2">ເງິນຈະຖືກຫັກຈາກກະເປົ໋ ແລະ ທ່ານຈະໄດ້ຮັບສິນຄ້າທັນທີ</p>`,
     confirmButtonText:'ຊື້ທັນທີ', cancelButtonText:'ຍົກເລີກ',
     showCancelButton:true, background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC', cancelButtonColor:'#3A4560'
   });
   if(!result.isConfirmed) return;
-  // ຫັກເງິນ
+  // refresh shop data and re-check availability right before charging (someone may have just bought the last one)
+  try{ await pullAdminDataFromFirestore(); }catch(e){}
+  const pFresh = await api.getProduct(productId);
+  const freshStock = (pFresh && pFresh.stock!==undefined && pFresh.stock!==null && pFresh.stock!=='') ? (parseInt(pFresh.stock)||0) : null;
+  if(!pFresh || pFresh.status!=='available' || (freshStock!==null && freshStock<=0)){
+    toastErr('ສິນຄ້ານີ້ຂາຍໝົດແລ້ວ'); renderHomeGrids(); renderProductList(); closeProductModal(); return;
+  }
+  // ຫັກເງິນ — atomic on the server (Firestore transaction), not from the local cache
+  try{
+    await adjustUserBalance(user.id, -p.price, {strict:true});
+  }catch(e){
+    if(e && e.message==='INSUFFICIENT_BALANCE'){ await refreshOwnUserFromFirestore(); toastErr('ຍອດເງິນບໍ່ພໍ'); }
+    else { console.warn(e); toastErr('ຫັກເງິນບໍ່ສຳເລັດ, ກະລຸນາລອງໃໝ່'); }
+    return;
+  }
   const users = loadDB(DB_KEYS.users,[]);
   const uIdx = users.findIndex(x=>x.id===user.id);
-  if(uIdx<0){ toastErr('ເກີດຂໍ້ຜິດພາດ, ກະລຸນາລອງໃໝ່'); return; }
-  users[uIdx].balance = (users[uIdx].balance||0) - p.price;
-  saveDB(DB_KEYS.users, users);
   // ສ້າງ order
   const order = {
     id: uid('ord'),
     userId: user.id,
     productId: p.id,
     amount: p.price,
-    status: 'pending_verification',
+    status: 'completed',            // wallet purchases need no admin approval
     paymentMethod: 'balance',
     slip: null,
     createdAt: nowISO(),
-    verifiedAt: null,
-    deliveryCode: null,
-    deliveryVideoUrl: null
+    verifiedAt: nowISO(),
+    deliveryCode: pFresh.deliveryCode || `${pFresh.name} — ຕິດຕໍ່ແອດມິນເພື່ອຮັບຂໍ້ມູນສິນຄ້າ`,
+    deliveryVideoUrl: pFresh.videoUrl || null
   };
+  // take one item out of stock (same rule the admin approval used to apply)
+  const allProducts = loadDB(DB_KEYS.products,[]);
+  const pp = allProducts.find(x=>x.id===productId);
+  if(pp){
+    if(pp.stock!==undefined && pp.stock!==null && pp.stock!==''){
+      pp.stock = Math.max(0, (parseInt(pp.stock)||0) - 1);
+      if(pp.stock<=0) pp.status='sold';
+    } else { pp.status='sold'; }
+    saveDB(DB_KEYS.products, allProducts);
+  }
   const orders = loadDB(DB_KEYS.orders,[]);
   orders.unshift(order);
   saveDB(DB_KEYS.orders, orders);
-  log('ORDER_PLACE', `Order ${order.id} by ${user.username} for ${p.name} ₭${p.price}`);
+  log('ORDER_WALLET_PAY', `${user.username} ຊື້ ${p.name} ₭${fmtK(p.price)} (ຮັບທັນທີ)`);
   // ແຈ້ງ Facebook
   const settings = loadDB(DB_KEYS.settings,{});
   const _link = (settings.adminPanelUrl||'').trim().replace(/\/$/,'');
-  const _linkLine = _link ? `\n👉 ໜ້າແອັດມິນ: ${_link}/?tab=payments` : '';
-  sendFacebookNotify(`ລູກຄ້າສັ່ງຊື້ສິນຄ້າ (ຊຳລະດ້ວຍ Wallet)\n👤 ${user.username}\n🛒 ${p.name}\n💰 ₭${fmtK(p.price)}${_linkLine}`);
+  const _linkLine = _link ? `\n👉 ໜ້າແອັດມິນ: ${_link}/?tab=orders` : '';
+  sendFacebookNotify(`ລູກຄ້າຊື້ສິນຄ້າສຳເລັດ (Wallet, ສົ່ງໃຫ້ທັນທີ)\n👤 ${user.username}\n🛒 ${p.name}\n💰 ₭${fmtK(p.price)}${_linkLine}`);
   // ແຈ້ງເຕືອນຜູ້ໃຊ້
-  users[uIdx].notifications = users[uIdx].notifications||[];
-  users[uIdx].notifications.push({ id:uid('ntf'), title:'ສັ່ງຊື້ສຳເລັດ', message:`ຄຳສັ່ງຊື້ ${p.name} ₭${fmtK(p.price)} ສຳເລັດ. ລໍຖ້າແອດມິນຢືນຢັນ.`, read:false, at:nowISO() });
-  saveDB(DB_KEYS.users, users);
+  if(uIdx>-1){
+    users[uIdx].notifications = users[uIdx].notifications||[];
+    users[uIdx].notifications.push({ id:uid('ntf'), title:'ຊື້ສຳເລັດ', message:`ທ່ານຊື້ ${p.name} ₭${fmtK(p.price)} ສຳເລັດ. ເບິ່ງລະຫັດໄດ້ທີ່ ສິນຄ້າຊື້ແລ້ວ.`, read:false, at:nowISO() });
+    saveDB(DB_KEYS.users, users);
+  }
   renderAuthArea();
   closeProductModal();
+  renderHomeGrids(); updateHeroStats();
   Swal.fire({
-    icon:'success', title:'ສັ່ງຊື້ສຳເລັດ! ✅',
-    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ຄຳສັ່ງຊື້ <b style="color:#E7EAF3;">${escapeHtml(p.name)}</b> ຖືກສ້າງແລ້ວ</p>
+    icon:'success', title:'ຊື້ສຳເລັດ! ✅',
+    html:`<p style="font-size:14px;color:#94A3B8;margin-bottom:8px;">ທ່ານໄດ້ຮັບ <b style="color:#E7EAF3;">${escapeHtml(p.name)}</b> ແລ້ວ</p>
           <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;text-align:left;">
-            <p style="font-size:13px;color:#94A3B8;">⏳ ລໍຖ້າແອດມິນຢືນຢັນ <b style="color:#a78bfa;">1-5 ນາທີ</b></p>
-            <p style="font-size:12px;color:#64748B;margin-top:6px;">📋 ກວດສອບໄດ້ທີ່ ແດດສ໌ບອດ → ປະຫວັດການສັ່ງຊື້</p>
+            <p style="font-size:12px;color:#94A3B8;margin-bottom:4px;">ລະຫັດ / ຂໍ້ມູນສິນຄ້າ</p>
+            <p style="font-size:13px;color:#67E8F9;font-family:monospace;word-break:break-all;">${escapeHtml(order.deliveryCode)}</p>
           </div>`,
     background:'#131826', color:'#E7EAF3', confirmButtonColor:'#7C5CFC',
-    confirmButtonText:'ເບິ່ງປະຫວັດ'
-  }).then(()=>{ go('dashboard'); dashTab('orders'); });
+    confirmButtonText:'ເບິ່ງສິນຄ້າຊື້ແລ້ວ'
+  }).then(()=>{ go('dashboard'); dashTab('mycards'); });
 }
 
 function renderTopupHistory(){
