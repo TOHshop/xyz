@@ -818,15 +818,23 @@ const api = {
     }
     let users = loadDB(DB_KEYS.users, []);
     let user = users.find(u=> u.id===cred.user.uid);
-    if(!user){
-      // First login on this device/browser: pull the profile down from Firestore.
+    // Always pull the current profile from Firestore on login rather than trusting
+    // whatever this device/browser had cached — a stale cache (e.g. this device's
+    // last-known balance from before a purchase made on another device, or before
+    // this same device fully synced) would otherwise show wrong info right after login.
+    try{
       const snap = await fbDb.collection('users').doc(cred.user.uid).get();
       if(snap.exists){
-        user = snap.data();
-        users.push(user); saveDB(DB_KEYS.users, users);
-      } else {
+        const remote = snap.data();
+        if(user){ Object.assign(user, remote); const idx = users.findIndex(u=>u.id===cred.user.uid); users[idx]=user; }
+        else { user = remote; users.push(user); }
+        localStorage.setItem(DB_KEYS.users, JSON.stringify(users));
+      } else if(!user){
         throw new Error('ບໍ່ພົບຂໍ້ມູນຜູ້ໃຊ້ໃນຖານຂໍ້ມູນ');
       }
+    }catch(e){
+      if(!user) throw (e.message==='ບໍ່ພົບຂໍ້ມູນຜູ້ໃຊ້ໃນຖານຂໍ້ມູນ' ? e : new Error('ບໍ່ພົບຂໍ້ມູນຜູ້ໃຊ້ໃນຖານຂໍ້ມູນ'));
+      // else: fetch failed (offline) but we still have a local copy — proceed with it
     }
     log('LOGIN', `User login: ${user.username}`);
     return { token: 'jwt.'+uid('tok'), refreshToken: 'rft.'+uid('tok'), user };
@@ -1287,6 +1295,11 @@ async function doLogin(){
   try{
     const {user} = await api.login({id:idv, password:pass});
     SESSION = {role:'user', id:user.id}; saveDB(DB_KEYS.session, SESSION);
+    // this device/browser may have a stale cached balance from before (e.g. from
+    // before a purchase made elsewhere) — pull the real current balance from the
+    // cloud now, so the very first screen after login shows the correct amount
+    // instead of a stale one that would otherwise only self-correct up to 15s later.
+    await refreshOwnUserFromFirestore();
     await pullAdminDataFromFirestore();
     renderSiteBranding(); applyBackground(); renderHeroBanner(); renderMarquee(); renderHomeGrids(); updateHeroStats();
     renderAuthArea(); toastOk('ເຂົ້າສູ່ລະບົບສຳເລັດ'); go('products');
@@ -1317,6 +1330,7 @@ async function doRegister(){
   try{
     const {user} = await api.register({username,password});
     SESSION = {role:'user', id:user.id}; saveDB(DB_KEYS.session, SESSION);
+    await refreshOwnUserFromFirestore();
     await pullAdminDataFromFirestore();
     renderSiteBranding(); applyBackground(); renderHeroBanner(); renderMarquee(); renderHomeGrids(); updateHeroStats();
     renderAuthArea(); toastOk('ສະໝັກສະມາຊິກສຳເລັດ!'); go('products');
