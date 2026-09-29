@@ -581,6 +581,7 @@ const fbDb = firebase.firestore();
 // Firebase Auth needs an email, but this app only collects a username,
 // so we map username -> a fake email address under a private domain.
 function usernameToEmail(username){ return String(username).toLowerCase()+'@vaultplay.app'; }
+const _userSynced = new Map();
 async function syncUserToFirestore(user, opts){
   try{
     const data = {...user};
@@ -591,7 +592,7 @@ async function syncUserToFirestore(user, opts){
     if(!(opts && opts.withBalance)) delete data.balance;
     await fbDb.collection('users').doc(user.id).set(data, {merge:true});
   }
-  catch(e){ console.warn('Firestore sync failed for user', user.id, e); }
+  catch(e){ _userSynced.delete(user.id); console.warn('Firestore sync failed for user', user.id, e); }
 }
 // Atomic balance change done on the server copy (Firestore transaction), then
 // mirrored into the local cache. delta < 0 = deduct, delta > 0 = add.
@@ -635,25 +636,32 @@ async function readPublicUserCount(){
   return null;
 }
 let _usersSyncOk = false;
-async function syncAllUsersFromFirestore(){
-  _usersSyncOk = false;
-  try{
-    const snap = await fbDb.collection('users').get();
-    const remoteUsers = snap.docs.map(d=>d.data());
-    _usersSyncOk = true;
-    publishPublicStats(remoteUsers.length);
-    const localUsers = loadDB(DB_KEYS.users, []);
-    const merged = [...localUsers];
-    remoteUsers.forEach(ru=>{
-      const idx = merged.findIndex(u=>u.id===ru.id);
-      if(idx>-1) merged[idx] = {...merged[idx], ...ru};
-      else merged.push(ru);
-    });
-    localStorage.setItem(DB_KEYS.users, JSON.stringify(merged));
-    return merged;
-  }catch(e){ console.warn('Failed to sync user list from Firestore', e); return loadDB(DB_KEYS.users, []); }
+let _usersInFlight = null, _lastUsersAt = 0;
+// PERF: deduped + throttled. Repeated clicks/tabs within 6s reuse the cache
+// instead of re-downloading the whole `users` collection every time.
+function syncAllUsersFromFirestore(force){
+  if(_usersInFlight) return _usersInFlight;
+  if(!force && _usersSyncOk && Date.now() - _lastUsersAt < 6000) return Promise.resolve(loadDB(DB_KEYS.users, []));
+  _usersInFlight = (async()=>{
+    _usersSyncOk = false;
+    try{
+      const snap = await fbDb.collection('users').get();
+      const remoteUsers = snap.docs.map(d=>d.data());
+      _usersSyncOk = true; _lastUsersAt = Date.now();
+      publishPublicStats(remoteUsers.length);
+      const localUsers = loadDB(DB_KEYS.users, []);
+      const merged = [...localUsers];
+      const pos = new Map(merged.map((u,i)=>[u.id,i]));
+      remoteUsers.forEach(ru=>{
+        if(pos.has(ru.id)) merged[pos.get(ru.id)] = {...merged[pos.get(ru.id)], ...ru};
+        else { pos.set(ru.id, merged.length); merged.push(ru); }
+      });
+      localStorage.setItem(DB_KEYS.users, JSON.stringify(merged));
+      return merged;
+    }catch(e){ console.warn('Failed to sync user list from Firestore', e); return loadDB(DB_KEYS.users, []); }
+  })().finally(()=>{ _usersInFlight = null; });
+  return _usersInFlight;
 }
-
 
 // ---- Global admin data sync (products, orders, logs, topups, admins, settings) ----
 // Unlike users (synced one doc per user), this is SHOP-WIDE data — one shared
@@ -673,46 +681,70 @@ async function _ensureAuth(){
   if(fbAuth.currentUser) return;
   try{ await fbAuth.signInAnonymously(); }catch(e){ console.warn('Anonymous auth failed', e); }
 }
+// PERF: coalesce rapid saves of the same key (e.g. product save + log() + order save)
+// into ONE Firestore write of the latest value, instead of one big write per call.
+const _syncQueue = {};
 function syncKeyToFirestore(key, val){
-  const p = (async () => {
-    await _ensureAuth();
-    if(!fbAuth.currentUser) return;
-    return fbDb.collection(CLOUD_COLLECTION).doc(key).set({ data: val, updatedAt: nowISO() })
-      .catch(e=>{
+  let q = _syncQueue[key];
+  if(q){ clearTimeout(q.timer); }
+  else {
+    q = _syncQueue[key] = {};
+    q.promise = new Promise(r=>{ q.resolve = r; });
+    _pendingSyncs.set(key, q.promise);
+    q.run = async ()=>{
+      if(_syncQueue[key] !== q) return;
+      delete _syncQueue[key];
+      clearTimeout(q.timer);
+      try{
+        await _ensureAuth();
+        if(!fbAuth.currentUser) return;
+        await fbDb.collection(CLOUD_COLLECTION).doc(key).set({ data: q.val, updatedAt: nowISO() });
+      }catch(e){
         console.warn('Firestore sync failed for', key, e);
         if(SESSION && SESSION.role==='admin' && typeof toastErr === 'function'){
           toastErr(`ບໍ່ສາມາດ sync "${key}" ຂຶ້ນຄລາວໄດ້ (ອາດຮູບໃຫຍ່ເກີນໄປ)`);
         }
-      })
-      .finally(()=>{ if(_pendingSyncs.get(key) === p) _pendingSyncs.delete(key); });
-  })();
-  _pendingSyncs.set(key, p);
+      }finally{
+        if(_pendingSyncs.get(key) === q.promise) _pendingSyncs.delete(key);
+        q.resolve();
+      }
+    };
+  }
+  q.val = val;
+  q.timer = setTimeout(q.run, 250);
 }
+// don't lose queued writes when the tab is hidden / closed
+function _flushSyncQueue(){ Object.keys(_syncQueue).forEach(k=>{ const q=_syncQueue[k]; if(q && q.run) q.run(); }); }
+document.addEventListener('visibilitychange', ()=>{ if(document.hidden) _flushSyncQueue(); });
+window.addEventListener('pagehide', _flushSyncQueue);
 // Pulls every shop-wide doc from Firestore and merges it into the local cache,
 // so changes the admin made on another device/browser show up here too.
-async function pullAdminDataFromFirestore(){
-  if(_pendingSyncs.size) await Promise.all([..._pendingSyncs.values()]);
-  try{
-    await _ensureAuth(); // guests get a silent anonymous session so they can read products without registering
-    const snap = await fbDb.collection(CLOUD_COLLECTION).get();
-    snap.docs.forEach(d=>{
-      const key = d.id;
-      if(!ADMIN_SYNC_KEYS.includes(key)) return;
-      const remote = d.data() && d.data().data;
-      if(remote === undefined || remote === null) return;
-      if(Array.isArray(remote)){
-        // FIX: the cloud copy is the single source of truth for these lists.
-        // Previously this merged in any locally-cached item missing from the
-        // cloud, which meant a product/order/etc an admin just deleted would
-        // get silently re-added on the very next pull (every tab switch
-        // pulls) because the deletion, once synced, made it "local-only"
-        // relative to the (now correct) cloud array — so delete never stuck.
-        localStorage.setItem(DB_KEYS[key], JSON.stringify(remote));
-      } else {
-        localStorage.setItem(DB_KEYS[key], JSON.stringify(remote));
-      }
-    });
-  }catch(e){ console.warn('Failed to pull admin data from Firestore', e); }
+let _pullInFlight = null, _lastPullAt = 0;
+// PERF: deduped + throttled (4s). Returns true if any local data actually changed,
+// so callers only re-render when needed. Pass force=true on money-critical paths.
+function pullAdminDataFromFirestore(force){
+  if(_pullInFlight) return _pullInFlight;
+  if(!force && Date.now() - _lastPullAt < 4000) return Promise.resolve(false);
+  _pullInFlight = (async()=>{
+    if(_pendingSyncs.size) await Promise.all([..._pendingSyncs.values()]);
+    let changed = false;
+    try{
+      await _ensureAuth();
+      const snap = await fbDb.collection(CLOUD_COLLECTION).get();
+      snap.docs.forEach(d=>{
+        const key = d.id;
+        if(!ADMIN_SYNC_KEYS.includes(key)) return;
+        const remote = d.data() && d.data().data;
+        if(remote === undefined || remote === null) return;
+        // cloud copy is the single source of truth (see earlier delete-sticks fix)
+        const s = JSON.stringify(remote);
+        if(localStorage.getItem(DB_KEYS[key]) !== s){ localStorage.setItem(DB_KEYS[key], s); changed = true; }
+      });
+      _lastPullAt = Date.now();
+    }catch(e){ console.warn('Failed to pull admin data from Firestore', e); }
+    return changed;
+  })().finally(()=>{ _pullInFlight = null; });
+  return _pullInFlight;
 }
 
 // Resizes/compresses an uploaded image file before it's turned into a
@@ -747,7 +779,15 @@ function loadDB(key, fallback){ try{ const v = localStorage.getItem(key); return
 function saveDB(key, val){
   localStorage.setItem(key, JSON.stringify(val));
   if(key === DB_KEYS.users && Array.isArray(val)){
-    val.forEach(u=>{ if(u && u.id) syncUserToFirestore(u); });
+    // PERF: only push users that actually changed (was: EVERY user on every save)
+    val.forEach(u=>{
+      if(!(u && u.id)) return;
+      const { balance, ...rest } = u;
+      const s = JSON.stringify(rest);
+      if(_userSynced.get(u.id) === s) return;
+      _userSynced.set(u.id, s);
+      syncUserToFirestore(u);
+    });
   }
   const adminKeyName = Object.keys(DB_KEYS).find(k=>DB_KEYS[k]===key && ADMIN_SYNC_KEYS.includes(k));
   if(adminKeyName) syncKeyToFirestore(adminKeyName, val);
@@ -1265,9 +1305,13 @@ function renderRecentPurchases(){
   }
 }
 async function updateHeroStats(){
+  _paintHeroStats(null);   // instant paint from local cache (user count updated below)
   const users = await syncAllUsersFromFirestore();
   let userCount = users.length;
   if(!_usersSyncOk){ const pub = await readPublicUserCount(); if(pub !== null) userCount = pub; }
+  _paintHeroStats(userCount);
+}
+function _paintHeroStats(userCount){
   const orders = loadDB(DB_KEYS.orders, []);
   const products = loadDB(DB_KEYS.products, []);
   const completed = orders.filter(o=>o.status==='completed').length;
@@ -1275,7 +1319,7 @@ async function updateHeroStats(){
   document.getElementById('heroLiveCount').textContent = products.filter(p=>p.status==='available').length;
   const cU = document.getElementById('cardStatUsers');
   if(cU){
-    cU.textContent = userCount;
+    if(userCount !== null) cU.textContent = userCount;
     document.getElementById('cardStatProducts').textContent = products.filter(p=>p.status==='available').length;
     document.getElementById('cardStatCompleted').textContent = completed;
     document.getElementById('cardStatTopup').textContent = fmtK(topupTotal);
@@ -1418,7 +1462,8 @@ async function openProductModalById(id){
         ${stockHtml? `<p class="mt-2">${stockHtml}</p>` : ''}
         ${hasOptions ? `
         <div class="mt-4">
-          <label class="text-xs font-display text-mist-400 uppercase">ເລືອກໄລຍະເວລາ / ຕົວເລືອກ</label>
+          <label class="text-xs font-display text-mist-400 uppercase">ເລືອກມື້ / ຕົວເລືອກ</label>
+          <p class="text-[11px] text-mist-400 mt-1">ຫຼັງຊື້ ທ່ານຈະໄດ້ຮັບຂໍ້ມູນຂອງຕົວເລືອກທີ່ເລືອກ</p>
           <div class="grid grid-cols-2 gap-2 mt-2">
             ${p.options.map((o,i)=>`<button type="button" onclick="selectPmOption('${o.id}')" data-opt-id="${o.id}" class="pm-option-btn px-3 py-2.5 rounded-lg bg-ink-900 border ${i===0?'border-plasma-500 bg-plasma-500/10':'border-ink-600'} text-mist-200 text-sm font-display hover:border-plasma-500 text-left">
               <div class="font-600">${escapeHtml(o.label)}</div>
@@ -1482,10 +1527,10 @@ async function doLogin(){
     // before a purchase made elsewhere) — pull the real current balance from the
     // cloud now, so the very first screen after login shows the correct amount
     // instead of a stale one that would otherwise only self-correct up to 15s later.
-    await refreshOwnUserFromFirestore();
-    await pullAdminDataFromFirestore();
     renderSiteBranding(); applyBackground(); renderHeroBanner(); renderMarquee(); renderHomeGrids(); updateHeroStats();
     renderAuthArea(); toastOk('ເຂົ້າສູ່ລະບົບສຳເລັດ'); go('home');
+    // refresh shop data in the background — no need to make the customer wait
+    pullAdminDataFromFirestore().then(ch=>{ if(ch){ renderSiteBranding(); applyBackground(); renderHeroBanner(); renderMarquee(); renderHomeGrids(); updateHeroStats(); } }).catch(()=>{});
   }catch(e){ toastErr(e.message); }
 }
 function checkUsernameAvailability(){
@@ -1513,10 +1558,10 @@ async function doRegister(){
   try{
     const {user} = await api.register({username,password});
     SESSION = {role:'user', id:user.id}; saveDB(DB_KEYS.session, SESSION);
-    await refreshOwnUserFromFirestore();
-    await pullAdminDataFromFirestore();
     renderSiteBranding(); applyBackground(); renderHeroBanner(); renderMarquee(); renderHomeGrids(); updateHeroStats();
     renderAuthArea(); toastOk('ສະໝັກສະມາຊິກສຳເລັດ!'); go('home');
+    // refresh shop data in the background — no need to make the customer wait
+    pullAdminDataFromFirestore().then(ch=>{ if(ch){ renderSiteBranding(); applyBackground(); renderHeroBanner(); renderMarquee(); renderHomeGrids(); updateHeroStats(); } }).catch(()=>{});
   }catch(e){ toastErr(e.message); }
 }
 function doForgot(){
@@ -1924,17 +1969,19 @@ async function buyNow(productId){
   });
   if(!result.isConfirmed) return;
   // refresh shop data and re-check availability right before charging (someone may have just bought the last one)
-  try{ await pullAdminDataFromFirestore(); }catch(e){}
+  Swal.fire({ title:'ກຳລັງດຳເນີນການ...', allowOutsideClick:false, allowEscapeKey:false, showConfirmButton:false, background:'#0C0607', color:'#F3ECEC', didOpen:()=>Swal.showLoading() });
+  try{ await pullAdminDataFromFirestore(true); }catch(e){}
   const pFresh = await api.getProduct(productId);
   const freshStock = (pFresh && pFresh.stock!==undefined && pFresh.stock!==null && pFresh.stock!=='') ? (parseInt(pFresh.stock)||0) : null;
   if(!pFresh || pFresh.status!=='available' || (freshStock!==null && freshStock<=0)){
-    toastErr('ສິນຄ້ານີ້ຂາຍໝົດແລ້ວ'); renderHomeGrids(); renderProductList(); closeProductModal(); return;
+    Swal.close(); toastErr('ສິນຄ້ານີ້ຂາຍໝົດແລ້ວ'); renderHomeGrids(); renderProductList(); closeProductModal(); return;
   }
   // re-resolve the same option against the freshly-pulled product data, in case
   // the admin edited prices between opening the modal and confirming the purchase
   let freshPrice = price;
+  let freshOpt = null;
   if(selectedOption && pFresh.options && pFresh.options.length){
-    const freshOpt = pFresh.options.find(o=>o.id===selectedOption.id) || pFresh.options.find(o=>o.label===selectedOption.label);
+    freshOpt = pFresh.options.find(o=>o.id===selectedOption.id) || pFresh.options.find(o=>o.label===selectedOption.label);
     if(freshOpt) freshPrice = freshOpt.price;
   } else if(!selectedOption){
     freshPrice = pFresh.price;
@@ -1943,6 +1990,7 @@ async function buyNow(productId){
   try{
     await adjustUserBalance(user.id, -freshPrice, {strict:true});
   }catch(e){
+    Swal.close();
     if(e && e.message==='INSUFFICIENT_BALANCE'){ await refreshOwnUserFromFirestore(); toastErr('ຍອດເງິນບໍ່ພໍ'); }
     else { console.warn(e); toastErr('ຫັກເງິນບໍ່ສຳເລັດ, ກະລຸນາລອງໃໝ່'); }
     return;
@@ -1961,7 +2009,7 @@ async function buyNow(productId){
     slip: null,
     createdAt: nowISO(),
     verifiedAt: nowISO(),
-    deliveryCode: pFresh.deliveryCode || `${pFresh.name} — ຕິດຕໍ່ແອດມິນເພື່ອຮັບຂໍ້ມູນສິນຄ້າ`,
+    deliveryCode: (freshOpt && freshOpt.deliveryCode) || (selectedOption && selectedOption.deliveryCode) || pFresh.deliveryCode || `${pFresh.name} — ຕິດຕໍ່ແອດມິນເພື່ອຮັບຂໍ້ມູນສິນຄ້າ`,
     deliveryVideoUrl: pFresh.videoUrl || null
   };
   // take one item out of stock (same rule the admin approval used to apply)
